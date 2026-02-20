@@ -1,0 +1,110 @@
+name: RDP-Tailscale-Workstation
+
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 360
+    
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure Windows RDP & User
+        shell: powershell
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+
+          $Password = "Workstation!" + (Get-Random -Minimum 1000 -Maximum 9999)
+          $Hashes = ConvertTo-SecureString $Password -AsPlainText -Force
+          New-LocalUser -Name "RDPUser" -Password $Hashes -Description "Tailscale User"
+          Add-LocalGroupMember -Group "Administrators" -Member "RDPUser"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDPUser"
+          
+          Write-Host "::add-mask::$Password"
+          echo "RDP_PASS=$Password" >> $env:GITHUB_ENV
+
+      - name: Install & Personalize Workstation
+        shell: powershell
+        run: |
+          choco install googlechrome vscode git -y --no-progress
+          $exts = @("GitHub.copilot", "eamodio.gitlens", "ms-python.python", "esbenp.prettier-vscode", "oderwat.indent-rainbow")
+          foreach ($id in $exts) { code --install-extension $id --force }
+
+          $wallUrl = "https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?q=80&w=2064"
+          $wallPath = "C:\Users\RDPUser\Pictures\wallpaper.jpg"
+          Invoke-WebRequest -Uri $wallUrl -OutFile $wallPath
+          Set-ItemProperty -Path 'HKCU:\Control Panel\Desktop' -Name Wallpaper -Value $wallPath
+          Set-ItemProperty -Path 'HKCU:\Control Panel\Desktop' -Name WallpaperStyle -Value "10"
+          rundll32.exe user32.dll, UpdatePerUserSystemParameters
+
+      - name: Setup Tailscale
+        shell: powershell
+        run: |
+          $dest = "$env:TEMP\tailscale.msi"
+          Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" -OutFile $dest
+          Start-Process msiexec.exe -ArgumentList "/i", "$dest", "/quiet", "/norestart" -Wait
+          & "C:\Program Files\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-workstation
+          $tsIP = & "C:\Program Files\Tailscale\tailscale.exe" ip -4
+          echo "TS_IP=$tsIP" >> $env:GITHUB_ENV
+
+      - name: Clone Project & Create Desktop Tools
+        shell: powershell
+        run: |
+          $desktop = "C:\Users\RDPUser\Desktop"
+          $projectPath = "$desktop\MyProject"
+          git clone "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" $projectPath
+          
+          $saveScript = "@echo off`ncd /d `"$projectPath`"`necho Syncing...`ngit add .`ngit commit -m `"RDP Save`"`ngit push`npause"
+          $saveScript | Out-File -FilePath "$desktop\SAVE_WORK.bat" -Encoding ascii
+          $todo = "# 🚀 6-Hour Sprint`n- [ ] Connect (Done)`n- [ ] Code Changes`n- [ ] Push Work"
+          $todo | Out-File -FilePath "$desktop\TODO.md" -Encoding utf8
+
+      - name: Connection Info
+        shell: powershell
+        run: |
+          Write-Host "`n========================================"
+          Write-Host "IP ADDRESS: $env:TS_IP"
+          Write-Host "USERNAME:   RDPUser"
+          Write-Host "PASSWORD:   $env:RDP_PASS"
+          Write-Host "========================================`n"
+
+      - name: Maintain Session
+        shell: powershell
+        run: |
+          while($true) { Start-Sleep -Seconds 60 }
+
+      - name: Emergency Final Push
+        if: always()
+        shell: powershell
+        run: |
+          $repo = "C:\Users\RDPUser\Desktop\MyProject"
+          if (Test-Path $repo) {
+            cd $repo
+            git config user.name "GitHub Action"
+            git config user.email "action@github.com"
+            git add .
+            git commit -m "Emergency Auto-Save"
+            git push
+          }
+
+      - name: Tailscale Cleanup (De-register Node)
+        if: always()
+        shell: powershell
+        run: |
+          $statusJson = & "C:\Program Files\Tailscale\tailscale.exe" status --json | ConvertFrom-Json
+          $deviceId = $statusJson.Self.ID
+          if ($deviceId) {
+              $auth = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("${{ secrets.TAILSCALE_API_KEY }}:"))
+              Invoke-RestMethod -Uri "https://api.tailscale.com/api/v2/device/$deviceId" -Method Delete -Headers @{ Authorization = "Basic $auth" }
+          }
+          
